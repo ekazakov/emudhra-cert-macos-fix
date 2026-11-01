@@ -82,7 +82,7 @@ async function main() {
   await fs.mkdir(path.join(HOME, 'Library', 'Logs'), {recursive: true});
   // Копируем только JS-скрипты и их библиотеку, без sudo и private certificates.
   await fs.mkdir(path.join(APP, 'src'), {recursive: true});
-  for (const file of ['check-emudhra-certs.mjs', 'run-emudhra-monitor.mjs', 'src/certificates.mjs', 'src/system.mjs']) {
+  for (const file of ['check-emudhra-certs.mjs', 'run-emudhra-monitor.mjs', 'src/certificates.mjs', 'src/system.mjs', 'src/console.mjs']) {
     const target = path.join(APP, file);
     await fs.copyFile(path.join(SOURCE, file), target);
     await fs.chmod(target, 0o700);

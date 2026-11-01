@@ -9,6 +9,7 @@ import { isIP } from 'node:net';
 import { $ } from 'zx';
 import { SYSTEM_BUNDLE, parseCertificates, readBundle, summarize, COMPROMISED } from './src/certificates.mjs';
 import { parseArgs, requireMac } from './src/system.mjs';
+import { keyword, colorText, rootCount } from './src/console.mjs';
 
 // Эти тестовые хосты опубликованы на странице инцидента eMudhra.
 const HOSTS = [
@@ -253,12 +254,16 @@ export async function runAudit({liveMode = '', macOnly = true} = {}) {
 // Текстовый вывод остаётся похожим на предыдущий Bash-скрипт.
 function printHuman(audit) {
   for (const source of audit.sources) {
-    console.log(`${source.keychain ? '[INFO]' : '[STORE]'} ${source.label}: ${source.certificates} сертификатов; emSign=${source.em}, AAA=${source.aaa}`);
+    console.log(`${source.keychain ? '[INFO]' : '[STORE]'} ${source.label}: ${source.certificates} сертификатов; ${rootCount('emSign', source.em)}, ${rootCount('AAA', source.aaa)}`);
   }
-  for (const finding of audit.findings) console.log(`[${finding.type}] ${finding.source}: ${finding.detail}`);
-  for (const result of audit.live) console.log(`[${result.status}] ${result.client}: ${result.host} ${result.detail}`);
-  for (const item of audit.unknown) console.log(`[UNKNOWN] ${item.source}: ${item.reason}`);
-  console.log(`RESULT: exit=${audit.exitCode} (0=нет находок, 1=проверить, 2=неполная проверка)`);
+  for (const finding of audit.findings) {
+    const tone = finding.type === 'COMPROMISED' ? 'red' : finding.type === 'REVIEW' ? 'yellow' : undefined;
+    console.log(`[${keyword(finding.type)}] ${finding.source}: ${colorText(finding.detail, tone)}`);
+  }
+  for (const result of audit.live) console.log(`[${keyword(result.status)}] ${result.client}: ${result.host} ${result.detail}`);
+  for (const item of audit.unknown) console.log(`[${keyword('UNKNOWN')}] ${item.source}: ${item.reason}`);
+  const resultTone = {0: 'green', 1: 'red', 2: 'yellow'}[audit.exitCode];
+  console.log(colorText(`RESULT: exit=${audit.exitCode} (0=нет находок, 1=проверить, 2=неполная проверка)`, resultTone));
   console.log('Наличие корня в bundle не доказывает принятие опасной TLS-цепочки.');
 }
 
@@ -273,5 +278,5 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       else printHuman(audit);
       process.exitCode = audit.exitCode;
     }
-  } catch (error) {console.error(`ERROR: ${error.message}`); process.exitCode = 2;}
+  } catch (error) {console.error(`${keyword('ERROR', process.stderr)}: ${error.message}`); process.exitCode = 2;}
 }
