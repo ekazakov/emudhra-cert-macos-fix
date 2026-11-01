@@ -1,0 +1,17 @@
+{
+  "name": "emudhra-macos-zx-tools",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only audit, reversible certificate mitigation and launchd alerts for macOS",
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "dependencies": {
+    "zx": "^8.0.0"
+  },
+  "scripts": {
+    "check": "node check-emudhra-certs.mjs",
+    "test": "node --test tests/*.test.mjs"
+  }
+}
