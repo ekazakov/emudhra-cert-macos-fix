@@ -1,5 +1,14 @@
 #!/usr/bin/env node
-// Удаление строго выбранных корневых сертификатов; ключ AAA опционален.
+/**
+ * Назначение: удалить выбранные корни из системного CA-bundle, чтобы клиенты,
+ * использующие этот файл, перестали строить через них цепочки доверия.
+ * Основные шаги:
+ * 1. Прочитать bundle, распознать цели по точным SHA-256 и подготовить текст в памяти.
+ * 2. Показать план; при dry-run или отсутствии целей завершиться без записи.
+ * 3. Проверить административные права и создать проверенную резервную копию.
+ * 4. Через общую файловую библиотеку заменить bundle и проверить результат.
+ * AAA удаляется только по явному флагу; Keychain не меняется, sudo не вызывается.
+ */
 import { SYSTEM_BUNDLE, readBundle, summarize, removeRoots, sha256 } from './src/certificates.mjs';
 import { requireMac, parseArgs, makeBackup, replaceWithBackup, timestamp } from './src/system.mjs';
 import { keyword, colorText, rootCount } from './src/console.mjs';

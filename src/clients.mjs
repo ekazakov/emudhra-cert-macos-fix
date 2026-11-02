@@ -1,4 +1,14 @@
-// Read-only HTTPS-пробы через реальные клиентские библиотеки и CLI.
+/**
+ * Назначение: исследовать реальные HTTPS-клиенты и их TLS-настройки, чтобы итог
+ * аудита опирался на поведение клиента, а не только на содержимое CA-файлов.
+ * Основные операции:
+ * 1. Обнаруживать executable и версии, читать разрешённые настройки доверия.
+ * 2. Получать выбранные CA и адаптеры pip/requests, Ruby, Perl и установленной Java.
+ * 3. По запросу запускать ограниченные по времени TLS-пробы на тестовых хостах.
+ * 4. Разделять ACCEPTED, REJECTED и UNKNOWN, передавая результаты объекту Audit.
+ * Git и пакетные менеджеры используют изоляцию auth-конфигурации; клиентские
+ * сертификаты RubyGems/Bundler блокируются до соединения. Пакеты не устанавливаются.
+ */
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -65,7 +75,12 @@ try:
  settings=session.merge_environment_settings(url,{},True,None,None)
  verify=settings.get('verify',session.verify)
  bundle=verify if isinstance(verify,str) else (certifi.where() if verify else None)
+ # trusted-host переключает адаптер, не меняя session.verify.
+ if kind=='pip':
+  from pip._internal.network.session import InsecureHTTPAdapter,InsecureCacheControlAdapter
+  if isinstance(session.get_adapter(url),(InsecureHTTPAdapter,InsecureCacheControlAdapter)): verify=False
  info={'version':version,'bundle':bundle,'verify':verify,'bundled':certifi.where(),'truststore':type(session.get_adapter(url).poolmanager.connection_pool_kw.get('ssl_context')).__module__}
+ if kind=='pip': info['trustedHosts']=options.trusted_hosts
  if sys.argv[3]=='live':
   try:
    response=session.get(url,timeout=7,stream=True,allow_redirects=False)
@@ -92,8 +107,10 @@ export async function scanPythonClients(audit,binary,hosts,live,{run=runProcess}
       if(data.absent){audit.clients.push({label,status:'NOT_INSTALLED'});break;}
       if(!metadata) {
         metadata=true;
-        audit.clients.push({label,version:data.version,bundle:data.bundle,verify:data.verify,truststore:data.truststore});
-        if(data.verify===false)audit.addFinding('REVIEW',label,'TLS certificate verification disabled');
+        audit.clients.push({label,version:data.version,bundle:data.bundle,verify:data.verify,truststore:data.truststore,trustedHosts:data.trustedHosts});
+        // Настройка может относиться не к первому тестовому URL, а к другим
+        // адресам. Отмечаем и сам факт заданных trusted-host, не только адаптер.
+        if(data.verify===false || data.trustedHosts?.length)audit.addFinding('REVIEW',label,'TLS certificate verification disabled');
         if(data.bundle) {
           try{audit.scanPEM(`${label}: selected CA bundle`,await fs.readFile(data.bundle,'utf8'));}
           catch{audit.addUnknown(label,'Не удалось прочитать выбранный CA bundle');}
@@ -133,19 +150,40 @@ export async function packageProbeEnvironment(temp,settings,original=process.env
   return env;
 }
 
-const RUBY_PROBE=`require 'json'; require 'uri'; require 'net/http'; require 'openssl'
+// Только отсутствие ключа Git (exit 1 без диагностики) означает default.
+// Ошибка чтения не разрешает запускать другой, искусственно пустой TLS config.
+async function readTLSSettings(binary,kind,url,run,cwd) {
+  const settings={};
+  for(const key of kind==='git'?['http.sslCAInfo','http.sslCAPath','http.sslBackend','http.sslVerify']:['cafile','strict-ssl']) {
+    const args=kind==='git'?['config',...(key==='http.sslVerify'?['--bool']:[]),'--get-urlmatch',key,url]:['config','get',key];
+    const result=await run(binary,args,{cwd});
+    if(result.code===0 && !result.error)settings[key]=result.stdout.trim();
+    else if(!(kind==='git' && result.code===1 && !result.error && !result.stdout.trim() && !result.stderr.trim()))return null;
+  }
+  return settings;
+}
+
+export const RUBY_PROBE=`require 'json'; require 'uri'; require 'net/http'; require 'openssl'
 kind,url,mode=ARGV; u=URI(url)
 begin
  if kind=='gem'; require 'rubygems/remote_fetcher'; end
  if kind=='bundle'; require 'bundler'; require 'bundler/fetcher'; require 'bundler/source/rubygems/remote'; end
  info={version:RUBY_VERSION, bundle:ENV['SSL_CERT_FILE']||OpenSSL::X509::DEFAULT_CERT_FILE}
- if kind=='gem'; info[:bundle]=Gem.configuration.ssl_ca_cert||info[:bundle]; end
- if kind=='bundle'; info[:bundle]=Bundler.settings[:ssl_ca_cert]||info[:bundle]; end
+ gem_config=kind=='bundle' ? Bundler.rubygems.configuration : (kind=='gem' ? Gem.configuration : nil)
+ gem_ca=gem_config.respond_to?(:ssl_ca_cert) ? gem_config.ssl_ca_cert : nil
+ client_cert=gem_config.respond_to?(:ssl_client_cert) ? gem_config.ssl_client_cert : nil
+ if kind=='gem'; info[:bundle]=gem_ca||info[:bundle]; end
+ if kind=='bundle'
+  info[:bundle]=Bundler.settings[:ssl_ca_cert]||gem_ca||info[:bundle]
+  client_cert=Bundler.settings[:ssl_client_cert]||client_cert
+ end
  if mode=='live'
   begin
    # Не отправляем клиентский сертификат из конфигурации неизвестному test host.
-   if kind=='gem' && Gem.configuration.respond_to?(:ssl_client_cert) && Gem.configuration.ssl_client_cert; raise 'client certificate configured'; end
-   if kind=='bundle' && Bundler.settings[:ssl_client_cert]; raise 'client certificate configured'; end
+   if ['gem','bundle'].include?(kind) && client_cert
+    info[:status]='UNKNOWN';info[:detail]='client certificate configured; network probe skipped'
+    puts JSON.generate(info);exit
+   end
    if kind=='gem'
     Gem::RemoteFetcher.fetcher.fetch_path(u)
    elsif kind=='bundle'
@@ -204,12 +242,8 @@ export async function scanAdditionalClients(audit,hosts,live,{run=runProcess,fin
         // Читаем только CA-путь и переключатель проверки, не полный config:
         // в нём могут находиться registry tokens и пароли прокси.
         if(['git','npm','pnpm','yarn'].includes(kind)) {
-          metadata.settings={};
-          for(const key of kind==='git'?['http.sslCAInfo','http.sslCAPath','http.sslBackend','http.sslVerify']:['cafile','strict-ssl']) {
-            const args=kind==='git'?['config','--get-urlmatch',key,`https://${hosts[0]}/`]:['config','get',key];
-            const config=await run(binary,args,{cwd:temp});
-            if(config.code===0)metadata.settings[key]=config.stdout.trim().slice(0,500);
-          }
+          metadata.settings=await readTLSSettings(binary,kind,`https://${hosts[0]}/`,run,temp);
+          if(!metadata.settings){metadata.status='UNKNOWN';audit.addUnknown(label,'Не удалось прочитать TLS-конфигурацию; сетевая проба не выполнялась');continue;}
           if(['false','0'].includes(metadata.settings['http.sslVerify'])||metadata.settings['strict-ssl']==='false'||(kind==='git'&&process.env.GIT_SSL_NO_VERIFY))audit.addFinding('REVIEW',label,'TLS certificate verification disabled');
           const bundle=metadata.settings['http.sslCAInfo']||metadata.settings.cafile;
           if(bundle && !['null','undefined'].includes(bundle)){
@@ -223,10 +257,11 @@ export async function scanAdditionalClients(audit,hosts,live,{run=runProcess,fin
             for(const host of live?hosts:[hosts[0]]) {
               const script=kind==='ruby'?RUBY_PROBE:PERL_PROBE;
               const r=await run(binary,['-e',script,adapter,`https://${host}/`,live?'live':'offline'],{cwd:temp});
-              let data;try{data=JSON.parse(r.stdout);}catch{audit.addUnknown(`${label} ${adapter}`,'probe failed');break;}
+              let data;try{if(r.code!==0||r.error)throw Error();data=JSON.parse(r.stdout);}catch{audit.addUnknown(`${label} ${adapter}`,r.error||'probe failed');break;}
               if(data.absent){audit.clients.push({label:`${label} ${adapter}`,status:'NOT_INSTALLED'});break;}
-              if(host===hosts[0]){audit.clients.push({label:`${label} ${adapter}`,bundle:data.bundle,version:data.version,verify:data.verify});if(data.verify===false)audit.addFinding('REVIEW',`${label} ${adapter}`,'TLS certificate verification disabled');}
+              if(host===hosts[0]){audit.clients.push({label:`${label} ${adapter}`,bundle:data.bundle,version:data.version,verify:data.verify,status:data.status==='UNKNOWN'?'UNKNOWN':undefined});if(data.verify===false)audit.addFinding('REVIEW',`${label} ${adapter}`,'TLS certificate verification disabled');}
               if(live)audit.addLive(`${label} ${adapter}`,host,data.status||'UNKNOWN',data.detail);
+              else if(data.status==='UNKNOWN')audit.addUnknown(`${label} ${adapter}`,data.detail||'metadata probe failed');
             }
           }
           continue;
@@ -249,10 +284,10 @@ export async function scanAdditionalClients(audit,hosts,live,{run=runProcess,fin
           const url=`https://${host}/`;
           if(kind==='git' && host!==hosts[0]){
             gitTLS.length=0;
-            for(const key of ['http.sslCAInfo','http.sslCAPath','http.sslBackend','http.sslVerify']){
-              const config=await run(binary,['config','--get-urlmatch',key,url],{cwd:temp});
-              if(config.code===0)gitTLS.push('-c',`${key}=${config.stdout.trim()}`);
-            }
+            const settings=await readTLSSettings(binary,kind,url,run,temp);
+            if(!settings){audit.addLive(label,host,'UNKNOWN','TLS config unavailable; network probe skipped');continue;}
+            for(const [key,value] of Object.entries(settings))gitTLS.push('-c',`${key}=${value}`);
+            if(settings['http.sslVerify']==='false')audit.addFinding('REVIEW',label,`${host}: TLS certificate verification disabled`);
           }
           const specs={
             git:[...gitTLS,'-c','credential.helper=','-c','core.askPass=','-c','http.followRedirects=false','ls-remote',url],
