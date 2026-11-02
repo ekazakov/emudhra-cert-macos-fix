@@ -10,6 +10,7 @@ import { $ } from 'zx';
 import { SYSTEM_BUNDLE, parseCertificates, readBundle, summarize, COMPROMISED } from './src/certificates.mjs';
 import { parseArgs, requireMac } from './src/system.mjs';
 import { keyword, colorText, rootCount } from './src/console.mjs';
+import { scanPythonClients, scanAdditionalClients } from './src/clients.mjs';
 
 // Эти тестовые хосты опубликованы на странице инцидента eMudhra.
 const HOSTS = [
@@ -35,16 +36,16 @@ async function command(commandPromise) {
 
 // Упаковываем события в JSON, чтобы монитор мог сравнивать находки без grep.
 export class Audit {
-  constructor() { this.sources = []; this.findings = []; this.unknown = []; this.live = []; }
+  constructor() { this.sources = []; this.findings = []; this.unknown = []; this.live = []; this.clients = []; }
   addFinding(type, source, detail) { this.findings.push({type, source, detail}); }
   addUnknown(source, reason) { this.unknown.push({source, reason: String(reason).slice(0, 250)}); }
-  scanPEM(label, pem, {keychain = false} = {}) {
+  scanPEM(label, pem, {keychain = false, inventory = false} = {}) {
     try {
       const result = summarize(pem);
-      this.sources.push({label, certificates: result.total, em: result.em, aaa: result.aaa, keychain});
+      this.sources.push({label, certificates: result.total, em: result.em, aaa: result.aaa, keychain, inventory});
       // В Keychain присутствие корня не трактуем как доверие: macOS блокирует intermediates отдельно.
-      if (!keychain && result.em) this.addFinding('REVIEW', label, `emSign ECC Root CA - G3: ${result.em}`);
-      if (!keychain && result.aaa) this.addFinding('REVIEW', label, `AAA Certificate Services: ${result.aaa}`);
+      if (!keychain && !inventory && result.em) this.addFinding('REVIEW', label, `emSign ECC Root CA - G3: ${result.em}`);
+      if (!keychain && !inventory && result.aaa) this.addFinding('REVIEW', label, `AAA Certificate Services: ${result.aaa}`);
       // Промежуточный сертификат отмечаем по точному SHA-256, не по CN.
       for (const {name, sha256} of result.intermediates) this.addFinding('COMPROMISED', label, `${name} (${sha256})`);
     } catch (error) { this.addUnknown(label, error.message); }
@@ -55,7 +56,7 @@ export class Audit {
     if (status === 'UNKNOWN') this.addUnknown(client, `${host}: ${detail}`);
   }
   get exitCode() { return this.findings.length ? 1 : this.unknown.length ? 2 : 0; }
-  toJSON() { return {generatedAt: new Date().toISOString(), sources: this.sources, findings: this.findings, live: this.live, unknown: this.unknown, exitCode: this.exitCode}; }
+  toJSON() { return {generatedAt: new Date().toISOString(), sources: this.sources, clients: this.clients, findings: this.findings, live: this.live, unknown: this.unknown, exitCode: this.exitCode}; }
 }
 
 // Дедупликация предотвращает повторный аудит одного файла через разные переменные.
@@ -157,7 +158,7 @@ export async function scanPython(audit, seen, liveAll, {binaries: suppliedBinari
   const binaries = suppliedBinaries ?? await pythonExecutables();
   if (!binaries.length) audit.addUnknown('Python', 'Не найден доступный интерпретатор Python 3');
   for (const binary of binaries) {
-    const meta = await command($({quiet: true, nothrow: true, timeout: 12000})`${binary} -c ${PYTHON_CONTEXT}`);
+    const meta = await command($({quiet: true, nothrow: true, timeout: 12000})`${binary} -B -c ${PYTHON_CONTEXT}`);
     if (meta.exitCode) { audit.addUnknown(binary, meta.stderr || `exit ${meta.exitCode}`); continue; }
     try {
       const data = JSON.parse(meta.stdout);
@@ -165,13 +166,16 @@ export async function scanPython(audit, seen, liveAll, {binaries: suppliedBinari
       for (const filename of data.cafiles) await auditFile(audit, seen, `${binary}: cafile`, filename);
       for (const dirname of data.capaths) await auditDirectory(audit, seen, `${binary}: capath`, dirname);
     } catch (error) { audit.addUnknown(binary, error.message); }
-    const certifi = await command($({quiet: true, nothrow: true, timeout: 12000})`${binary} -c ${PYTHON_CERTIFI}`);
+    const certifi = await command($({quiet: true, nothrow: true, timeout: 12000})`${binary} -B -c ${PYTHON_CERTIFI}`);
     if (!certifi.exitCode) {
-      try { for (const row of JSON.parse(certifi.stdout)) await auditFile(audit, seen, `${binary}: ${row.name}`, row.file); }
+      // Встроенный certifi — инвентарь пакета. Фактический выбор CA проверяется
+      // отдельно через PipSession/requests, а не по наличию файла на диске.
+      try { for (const row of JSON.parse(certifi.stdout)) audit.scanPEM(`${binary}: ${row.name} (package inventory)`, await fs.readFile(row.file,'utf8'), {inventory:true}); }
       catch (error) { audit.addUnknown(`${binary}: certifi`, error.message); }
     } else audit.addUnknown(`${binary}: certifi`, certifi.stderr || `exit ${certifi.exitCode}`);
+    await scanPythonClients(audit,binary,HOSTS,liveAll);
     if (liveAll) for (const host of HOSTS) {
-      const result = await command($({quiet: true, nothrow: true, timeout: 11000})`${binary} -c ${PYTHON_LIVE} ${host}`);
+      const result = await command($({quiet: true, nothrow: true, timeout: 11000})`${binary} -B -c ${PYTHON_LIVE} ${host}`);
       const [status, ...reason] = result.stdout.trim().split(/\s+/);
       audit.addLive(binary, host, ['ACCEPTED', 'REJECTED', 'UNKNOWN'].includes(status) ? status : 'UNKNOWN', reason.join(' ') || result.stderr);
     }
@@ -248,14 +252,16 @@ export async function runAudit({liveMode = '', macOnly = true} = {}) {
   await scanPython(audit, seen, liveMode === 'all');
   scanNode(audit);
   await scanLive(audit, liveMode);
+  await scanAdditionalClients(audit,HOSTS,liveMode === 'all');
   return audit;
 }
 
 // Текстовый вывод остаётся похожим на предыдущий Bash-скрипт.
 function printHuman(audit) {
   for (const source of audit.sources) {
-    console.log(`${source.keychain ? '[INFO]' : '[STORE]'} ${source.label}: ${source.certificates} сертификатов; ${rootCount('emSign', source.em)}, ${rootCount('AAA', source.aaa)}`);
+    console.log(`${source.keychain || source.inventory ? '[INFO]' : '[STORE]'} ${source.label}: ${source.certificates} сертификатов; ${rootCount('emSign', source.em)}, ${rootCount('AAA', source.aaa)}`);
   }
+  for (const client of audit.clients) console.log(`[CLIENT] ${client.label}: ${client.status || client.version || 'detected'}${client.bundle ? `; CA=${client.bundle}` : ''}${client.scope ? `; scope=${client.scope}` : ''}${client.settings ? `; settings=${JSON.stringify(client.settings)}` : ''}${client.truststore ? `; context=${client.truststore}` : ''}${client.verify === false ? '; TLS verification disabled' : ''}${client.detail ? `; ${client.detail}` : ''}`);
   for (const finding of audit.findings) {
     const tone = finding.type === 'COMPROMISED' ? 'red' : finding.type === 'REVIEW' ? 'yellow' : undefined;
     console.log(`[${keyword(finding.type)}] ${finding.source}: ${colorText(finding.detail, tone)}`);
